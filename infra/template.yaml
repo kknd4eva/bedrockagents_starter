@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Starter stack for an Amazon Bedrock Agent with an API Gateway tool backed by a .NET 10 Lambda function.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: bedrock-agent-starter
+    AllowedPattern: '^[a-zA-Z0-9-]{3,40}$'
+  FoundationModelId:
+    Type: String
+    Default: anthropic.claude-3-haiku-20240307-v1:0
+    Description: Bedrock foundation model identifier used by the agent.
+  ToolApiLambdaS3Bucket:
+    Type: String
+    Description: S3 bucket containing the zipped .NET 10 Lambda deployment artifact.
+  ToolApiLambdaS3Key:
+    Type: String
+    Description: S3 object key for the zipped .NET 10 Lambda deployment artifact.
+
+Resources:
+  ToolApiLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-tool-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  ToolApiLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-tool-api'
+      Role: !GetAtt ToolApiLambdaExecutionRole.Arn
+      Runtime: dotnet10
+      Handler: ToolApiLambda::ToolApiLambda.Function::FunctionHandler
+      Timeout: 30
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref ToolApiLambdaS3Bucket
+        S3Key: !Ref ToolApiLambdaS3Key
+      Environment:
+        Variables:
+          TOOL_API_BASE_URL: !GetAtt ToolApi.ApiEndpoint
+
+  ToolApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-http-api'
+      ProtocolType: HTTP
+
+  ToolApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ToolApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ToolApiLambda.Arn
+      PayloadFormatVersion: '2.0'
+
+  ToolApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ToolApi
+      RouteKey: 'GET /tool/insight'
+      Target: !Sub 'integrations/${ToolApiIntegration}'
+
+  ToolApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ToolApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ToolApiLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ToolApi}/*/*/tool/insight'
+
+  BedrockAgentResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-bedrock-agent-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-bedrock-agent-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${FoundationModelId}'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ToolApiLambda.Arn
+
+  BedrockToolLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ToolApiLambda
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceArn: !GetAtt BedrockAgent.AgentArn
+
+  BedrockAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Sub '${ProjectName}-agent'
+      Description: Starter Bedrock agent that uses an API Gateway backed .NET 10 Lambda tool.
+      AgentResourceRoleArn: !GetAtt BedrockAgentResourceRole.Arn
+      FoundationModel: !Ref FoundationModelId
+      AutoPrepare: true
+      IdleSessionTTLInSeconds: 900
+      Instruction: |
+        You are a helpful AWS assistant. Use your tool when users ask for insights about a topic.
+        Keep responses concise and explain the tool output clearly.
+      PromptOverrideConfiguration:
+        PromptConfigurations:
+          - PromptType: ORCHESTRATION
+            PromptState: ENABLED
+            PromptCreationMode: OVERRIDDEN
+            BasePromptTemplate: |
+              You are an AWS Bedrock Agent starter assistant.
+              Always decide whether the available tool should be called.
+              Use tool results as the source of truth.
+
+  BedrockAgentActionGroup:
+    Type: AWS::Bedrock::AgentActionGroup
+    Properties:
+      AgentId: !GetAtt BedrockAgent.AgentId
+      AgentVersion: DRAFT
+      ActionGroupName: tool-api-action-group
+      Description: Invokes an API Gateway endpoint backed by a .NET 10 Lambda function.
+      ActionGroupExecutor:
+        Lambda: !GetAtt ToolApiLambda.Arn
+      ApiSchema:
+        Payload: !Sub |
+          openapi: 3.0.1
+          info:
+            title: Tool API
+            version: '1.0.0'
+          servers:
+            - url: ${ToolApi.ApiEndpoint}
+          paths:
+            /tool/insight:
+              get:
+                operationId: getInsight
+                description: Returns a starter insight for the requested topic.
+                parameters:
+                  - name: topic
+                    in: query
+                    required: false
+                    schema:
+                      type: string
+                responses:
+                  '200':
+                    description: Tool result
+                    content:
+                      application/json:
+                        schema:
+                          type: object
+                          properties:
+                            topic:
+                              type: string
+                            insight:
+                              type: string
+                            runtime:
+                              type: string
+
+  BedrockAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !GetAtt BedrockAgent.AgentId
+      AgentAliasName: !Sub '${ProjectName}-alias'
+      Description: Alias for invoking the starter bedrock agent.
+
+Outputs:
+  ToolApiEndpoint:
+    Description: HTTP API endpoint for the tool.
+    Value: !GetAtt ToolApi.ApiEndpoint
+  ToolApiLambdaArn:
+    Description: ARN of the .NET 10 tool Lambda function.
+    Value: !GetAtt ToolApiLambda.Arn
+  BedrockAgentId:
+    Description: ID of the Bedrock agent.
+    Value: !GetAtt BedrockAgent.AgentId
+  BedrockAgentAliasId:
+    Description: Alias ID for runtime invocations.
+    Value: !GetAtt BedrockAgentAlias.AgentAliasId
